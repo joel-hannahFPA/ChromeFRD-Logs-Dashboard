@@ -1,43 +1,58 @@
-# frd_readiness_simple.py
+# frd_readiness_secrets.py
+# Streamlit dashboard: Dry Run / Install tabs, Success & Fail tables
+# Reads Azure Blob via Streamlit secrets only.
 
-import os, json
+import json
 import pandas as pd
 import streamlit as st
 from azure.storage.blob import BlobServiceClient
-from dotenv import load_dotenv, find_dotenv
 
-# ---------- Env (connection string + container only) ----------
-load_dotenv(find_dotenv(), override=True)
+# ------------------ Secrets ------------------
+def _get_secret(path: str, default=None):
+    """Read nested keys from st.secrets, e.g. 'azure.connection_string'."""
+    try:
+        cur = st.secrets
+        for p in path.split("."):
+            cur = cur[p]
+        return cur
+    except Exception:
+        return default
 
-CONTAINER   = os.getenv("BLOB_CONTAINER", "vectorlogs")
-CONN_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+CONN_STRING = _get_secret("azure.connection_string")
+CONTAINER   = _get_secret("azure.container", "vectorlogs")
 
-# ---------- Azure helpers ----------
+# ------------------ Azure helpers ------------------
 @st.cache_resource(show_spinner=False)
 def get_container_client():
     if not CONN_STRING:
-        raise RuntimeError("Set AZURE_STORAGE_CONNECTION_STRING and BLOB_CONTAINER in your environment")
-    return BlobServiceClient.from_connection_string(CONN_STRING).get_container_client(CONTAINER)
+        raise RuntimeError(
+            "Missing Streamlit secrets. Add .streamlit/secrets.toml with:\n"
+            "[azure]\nconnection_string=\"...\"\ncontainer=\"vectorlogs\""
+        )
+    svc = BlobServiceClient.from_connection_string(CONN_STRING)
+    return svc.get_container_client(CONTAINER)
 
 def list_blob_meta(prefix: str, max_blobs: int = 500):
-    """Return [{name, last_modified}] newest first."""
+    """Return [{name, last_modified}] newest first under prefix."""
     cc = get_container_client()
     rows = []
     for b in cc.list_blobs(name_starts_with=prefix):
         rows.append({"name": b.name, "last_modified": getattr(b, "last_modified", None)})
-    rows.sort(key=lambda r: r["last_modified"] or pd.Timestamp.min, reverse=True)
+    # newest first
+    rows.sort(key=lambda r: pd.to_datetime(r["last_modified"]) if r["last_modified"] else pd.Timestamp.min,
+              reverse=True)
     return rows[:max_blobs]
 
 def read_blob_text(name: str) -> str:
     cc = get_container_client()
     return cc.download_blob(name).readall().decode("utf-8", errors="replace")
 
-# ---------- Tiny parser (only your 6 fields) ----------
+# ------------------ Minimal parser (6 fields) ------------------
 def parse_needed_fields(text: str) -> dict:
     """
-    Extract only:
-    Model, ServiceTag, TotalRAM, TPMError, DiskSize, InstallError
-    from either JSON lines or logfmt lines.
+    Extract exactly these fields (from JSON lines or logfmt lines):
+      Model, ServiceTag, TotalRAM, TPMError, DiskSize, InstallError
+    Mark Success=True unless we see InstallSkipped with error.
     """
     out = {
         "Model": None,
@@ -46,7 +61,7 @@ def parse_needed_fields(text: str) -> dict:
         "TPMError": None,
         "DiskSize": None,
         "InstallError": None,
-        "Success": True,  # flips to False if we see InstallSkipped/error
+        "Success": True,
     }
 
     for line in text.splitlines():
@@ -54,25 +69,24 @@ def parse_needed_fields(text: str) -> dict:
         if not s:
             continue
 
-        # JSON line first
+        # JSON line variant
         if s.startswith("{") and s.endswith("}"):
             try:
                 obj = json.loads(s)
                 sysinfo = obj.get("sysinfo") or {}
                 hw = sysinfo.get("Hardware") or {}
                 mem = sysinfo.get("Memory") or {}
-
                 if out["Model"] is None and isinstance(hw.get("Model"), str):
                     out["Model"] = hw["Model"]
                 if out["ServiceTag"] is None:
                     stg = hw.get("ServiceTag") or obj.get("service_tag")
-                    if isinstance(stg, str):
+                    if isinstance(stg, str) and stg:
                         out["ServiceTag"] = stg
                 if out["TotalRAM"] is None and mem.get("totalRAM") is not None:
                     out["TotalRAM"] = mem["totalRAM"]
                 if out["DiskSize"] is None and "diskSize" in obj:
                     out["DiskSize"] = obj["diskSize"]
-                if obj.get("msg") == "TPMChecked" and isinstance(obj.get("error"), str):
+                if out["TPMError"] is None and obj.get("msg") == "TPMChecked" and isinstance(obj.get("error"), str):
                     out["TPMError"] = obj["error"]
                 if obj.get("msg") == "InstallSkipped" and isinstance(obj.get("error"), str):
                     out["InstallError"] = obj["error"]
@@ -99,17 +113,25 @@ def parse_needed_fields(text: str) -> dict:
                 out["InstallError"] = part[1].split('"', 1)[0]
                 out["Success"] = False
 
-        # early exit if we already have all 6 fields
-        if all(k in out and out[k] is not None for k in ["Model","ServiceTag","TotalRAM","TPMError","DiskSize","InstallError"]):
+        # Done early if everything filled
+        if all(k in out and out[k] is not None for k in
+               ["Model", "ServiceTag", "TotalRAM", "TPMError", "DiskSize", "InstallError"]):
             break
 
     return out
 
-# ---------- UI ----------
+# ------------------ UI ------------------
 st.set_page_config(page_title="FRD Readiness — Dry Run vs Install", layout="wide")
 st.title("FRD Readiness — Dry Run vs Install")
 
-def render_tab(prefix: str, title: str, max_blobs: int = 500):
+with st.sidebar:
+    st.caption(f"Container: **{CONTAINER}**")
+    max_blobs = st.number_input("Max blobs per tab", min_value=10, max_value=5000, value=500, step=10)
+    auto = st.checkbox("Auto-refresh every 5s", value=False)
+    if auto:
+        st.experimental_rerun  # hint to Streamlit we're okay with frequent runs
+
+def render_tab(prefix: str, title: str, max_blobs: int):
     meta = list_blob_meta(prefix, max_blobs)
     if not meta:
         st.info(f"No blobs under `{prefix}`")
@@ -120,7 +142,7 @@ def render_tab(prefix: str, title: str, max_blobs: int = 500):
         try:
             text = read_blob_text(m["name"])
             row = parse_needed_fields(text)
-            # Date column from blob last_modified
+            # readable Date from blob meta
             row["Date"] = pd.to_datetime(m["last_modified"]).strftime("%Y-%m-%d %H:%M:%S") if m["last_modified"] else None
             rows.append(row)
         except Exception as e:
@@ -132,7 +154,7 @@ def render_tab(prefix: str, title: str, max_blobs: int = 500):
 
     df = pd.DataFrame(rows, columns=["Date","Model","ServiceTag","TotalRAM","TPMError","DiskSize","InstallError","Success"])
 
-    # newest first
+    # Sort newest first
     if "Date" in df:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.sort_values("Date", ascending=False, na_position="last")
@@ -150,6 +172,6 @@ def render_tab(prefix: str, title: str, max_blobs: int = 500):
 
 tab1, tab2 = st.tabs(["Dry Run", "Install"])
 with tab1:
-    render_tab("devices/dryrun/", "Dry Run")
+    render_tab("devices/dryrun/", "Dry Run", max_blobs)
 with tab2:
-    render_tab("devices/install/", "Install")
+    render_tab("devices/install/", "Install", max_blobs)
