@@ -182,8 +182,11 @@ def render_tab(prefix: str, title: str, max_blobs: int = MAX_BLOBS):
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.sort_values("Date", ascending=False, na_position="last")
 
-    success_df = df[df["Success"]].drop(columns=["Success"])
-    fail_df    = df[~df["Success"]].drop(columns=["Success"])
+    # --- Only keep the latest record per ServiceTag; split by latest state ---
+    latest = df.sort_values("Date").drop_duplicates("ServiceTag", keep="last")
+    success_df = latest[latest["Success"]].drop(columns=["Success"])
+    fail_df    = latest[~latest["Success"]].drop(columns=["Success"])
+    # -------------------------------------------------------------------------
 
     st.subheader(f"{title} — Success")
     st.dataframe(success_df, use_container_width=True, height=300)
