@@ -7,7 +7,7 @@ import streamlit as st
 from azure.storage.blob import BlobServiceClient
 from streamlit_autorefresh import st_autorefresh
 
-# ----------- Secrets -----------
+# ---------------- Secrets ----------------
 def _get_secret(path: str, default=None):
     try:
         cur = st.secrets
@@ -25,7 +25,7 @@ def _mask(s: str | None, show=6):
         return "(missing)"
     return s[:show] + "…" if len(s) > show else s
 
-# ----------- CSV store map (ServiceTag -> StoreName) -----------
+# ---------------- CSV store map (ServiceTag -> StoreName) ----------------
 CSV_CANDIDATES = [
     "StoreName vs ServiceTag.csv",
     "/mnt/data/StoreName vs ServiceTag.csv",
@@ -63,7 +63,7 @@ def load_store_map():
 
 STORE_MAP = load_store_map()
 
-# ----------- Azure helpers -----------
+# ---------------- Azure helpers ----------------
 @st.cache_resource(show_spinner=False)
 def get_container_client():
     if not CONN_STRING or not CONTAINER:
@@ -99,11 +99,11 @@ def read_blob_text(name: str) -> str:
     cc = get_container_client()
     return cc.download_blob(name).readall().decode("utf-8", errors="replace")
 
-# ----------- Minimal parser (6 fields) -----------
+# ---------------- Minimal parser (6 fields) ----------------
 def parse_needed_fields(text: str) -> dict:
     """
     Extract only: Model, ServiceTag, TotalRAM, TPMError, DiskSize, InstallError.
-    Success=True unless we see InstallSkipped with error.
+    Success=False if we see any ERROR-level line or an InstallSkipped with error.
     """
     out = {
         "Model": None,
@@ -115,12 +115,22 @@ def parse_needed_fields(text: str) -> dict:
         "Success": True,
     }
 
+    def _pick_error_from_logfmt(s: str) -> str | None:
+        # Prefer error="..." if present
+        if 'error="' in s:
+            return s.split('error="', 1)[1].split('"', 1)[0]
+        # Fallback: try msg=... token if present
+        if "msg=" in s:
+            part = s.split("msg=", 1)[1].split()[0]
+            return part.strip()
+        return None
+
     for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
 
-        # JSON line variant
+        # ---------- JSON line ----------
         if s.startswith("{") and s.endswith("}"):
             try:
                 obj = json.loads(s)
@@ -142,16 +152,28 @@ def parse_needed_fields(text: str) -> dict:
                 if out["DiskSize"] is None and "diskSize" in obj:
                     out["DiskSize"] = obj["diskSize"]
 
+                # TPM error if present on TPMChecked
                 if out["TPMError"] is None and obj.get("msg") == "TPMChecked" and isinstance(obj.get("error"), str):
                     out["TPMError"] = obj["error"]
 
+                # InstallSkipped is a failure
                 if obj.get("msg") == "InstallSkipped" and isinstance(obj.get("error"), str):
                     out["InstallError"] = obj["error"]
                     out["Success"] = False
-            except Exception:
-                pass  # fall through to logfmt
 
-        # logfmt tokens
+                # Any JSON with level == ERROR is a failure
+                lvl = str(obj.get("level") or "").upper()
+                if lvl == "ERROR":
+                    err = obj.get("error")
+                    if isinstance(err, str) and err:
+                        out["InstallError"] = err
+                    else:
+                        out["InstallError"] = obj.get("msg") or "ERROR"
+                    out["Success"] = False
+            except Exception:
+                pass  # fall through to logfmt if not valid JSON
+
+        # ---------- logfmt line ----------
         if out["Model"] is None and "sysinfo.Hardware.Model=" in s:
             out["Model"] = s.split("sysinfo.Hardware.Model=")[-1].split()[0].strip('"')
 
@@ -169,19 +191,28 @@ def parse_needed_fields(text: str) -> dict:
         if out["DiskSize"] is None and "diskSize=" in s:
             out["DiskSize"] = s.split("diskSize=")[-1].split()[0].strip('"')
 
+        # InstallSkipped (logfmt)
         if "msg=InstallSkipped" in s and "error=" in s:
-            part = s.split('error="', 1)
-            if len(part) > 1:
-                out["InstallError"] = part[1].split('"', 1)[0]
-                out["Success"] = False
+            err = s.split('error="', 1)[1].split('"', 1)[0]
+            out["InstallError"] = err
+            out["Success"] = False
 
-        # Early break if everything collected
-        if all(out[k] is not None for k in ["Model","ServiceTag","TotalRAM","TPMError","DiskSize","InstallError"]):
+        # Any ERROR-level line (logfmt)
+        if "level=ERROR" in s:
+            err = _pick_error_from_logfmt(s)
+            if err:
+                out["InstallError"] = err
+            else:
+                out["InstallError"] = "ERROR"
+            out["Success"] = False
+
+        # Early break if all fields collected and we already know failure status
+        if all(out[k] is not None for k in ["Model","ServiceTag","TotalRAM","TPMError","DiskSize"]) and out["InstallError"] is not None:
             break
 
     return out
 
-# ----------- UI -----------
+# ---------------- UI ----------------
 st.set_page_config(page_title="FRD Readiness — Dry Run vs Install", layout="wide")
 
 # Always auto-refresh every 5s
@@ -203,7 +234,6 @@ def _apply_store_map(df: pd.DataFrame) -> pd.DataFrame:
         return df
     norm = _normalize_st(df["ServiceTag"].fillna(""))
     mapped = norm.map(STORE_MAP)
-    # Keep None for missing matches (avoid fillna(None) which errors)
     df["StoreName"] = mapped.where(pd.notna(mapped), None)
     return df
 
