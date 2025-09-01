@@ -1,4 +1,4 @@
-# dashboard.py — Secrets-only, always auto-refresh, Dry Run / Install with Success & Fail tables (+ Store mapping)
+# dashboard.py — Secrets-only, always auto-refresh, Dry Run / Install with Success & Fail tables (+ StoreName mapping)
 
 import os
 import json
@@ -25,7 +25,7 @@ def _mask(s: str | None, show=6):
         return "(missing)"
     return s[:show] + "…" if len(s) > show else s
 
-# ----------- CSV store map -----------
+# ----------- CSV store map (ServiceTag -> StoreName) -----------
 CSV_CANDIDATES = [
     "StoreName vs ServiceTag.csv",
     "/mnt/data/StoreName vs ServiceTag.csv",
@@ -35,7 +35,7 @@ CSV_CANDIDATES = [
 def load_store_map():
     """
     Returns a dict {SERVICETAG -> StoreName}.
-    Accepts CSV with columns like: 'ServiceTag' and either 'Store' or 'StoreName' (case-insensitive).
+    Requires CSV with columns exactly: ServiceTag, StoreName.
     """
     path = None
     for cand in CSV_CANDIDATES:
@@ -44,34 +44,20 @@ def load_store_map():
             break
 
     if not path:
-        st.warning("Store map CSV not found (looked for: "
-                   + ", ".join([f"`{p}`" for p in CSV_CANDIDATES]) + ").")
+        st.warning("Store map CSV not found (looked for: " + ", ".join([f"`{p}`" for p in CSV_CANDIDATES]) + ").")
         return {}
 
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, usecols=["ServiceTag", "StoreName"])
     except Exception as e:
         st.warning(f"Failed to read store map CSV `{path}`: {e}")
         return {}
 
-    # Find columns (case-insensitive)
-    cols_lower = {c.lower(): c for c in df.columns}
-    st_col = cols_lower.get("servicetag") or cols_lower.get("service_tag")
-    store_col = cols_lower.get("store") or cols_lower.get("storename") or cols_lower.get("store name")
+    # Normalize for matching
+    df["ServiceTag"] = df["ServiceTag"].astype(str).str.strip().str.upper()
+    df["StoreName"]  = df["StoreName"].astype(str).str.strip()
 
-    if not st_col or not store_col:
-        st.warning(
-            f"Store map CSV `{path}` missing required columns. "
-            f"Need 'ServiceTag' and 'Store' (or 'StoreName'). Found columns: {list(df.columns)}"
-        )
-        return {}
-
-    # Normalize ServiceTag as UPPER + stripped
-    df = df[[st_col, store_col]].copy()
-    df[st_col] = df[st_col].astype(str).str.strip().str.upper()
-    df[store_col] = df[store_col].astype(str).str.strip()
-
-    mapping = dict(zip(df[st_col], df[store_col]))
+    mapping = dict(zip(df["ServiceTag"], df["StoreName"]))
     st.caption(f"📄 Loaded store map: {len(mapping)} entries from `{os.path.basename(path)}`")
     return mapping
 
@@ -211,12 +197,14 @@ def _normalize_st(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.upper()
 
 def _apply_store_map(df: pd.DataFrame) -> pd.DataFrame:
-    """Add a 'Store' column from STORE_MAP using normalized ServiceTag."""
+    """Add a 'StoreName' column from STORE_MAP using normalized ServiceTag."""
     if not isinstance(STORE_MAP, dict) or not STORE_MAP:
-        df["Store"] = None
+        df["StoreName"] = None
         return df
     norm = _normalize_st(df["ServiceTag"].fillna(""))
-    df["Store"] = norm.map(STORE_MAP).fillna(None)
+    mapped = norm.map(STORE_MAP)
+    # Keep None for missing matches (avoid fillna(None) which errors)
+    df["StoreName"] = mapped.where(pd.notna(mapped), None)
     return df
 
 def render_tab(prefix: str, title: str, max_blobs: int = MAX_BLOBS):
@@ -254,17 +242,14 @@ def render_tab(prefix: str, title: str, max_blobs: int = MAX_BLOBS):
     # Only keep the latest record per ServiceTag; split by latest state
     latest = df.sort_values("Date").drop_duplicates("ServiceTag", keep="last")
 
-    # Attach Store column using CSV mapping
+    # Attach StoreName from CSV mapping
     latest = _apply_store_map(latest)
 
     # Reorder columns for display
-    display_cols = ["Date","Store","Model","ServiceTag","TotalRAM","TPMError","DiskSize","InstallError"]
+    display_cols = ["Date","StoreName","Model","ServiceTag","TotalRAM","TPMError","DiskSize","InstallError"]
 
-    success_df = latest[latest["Success"]].drop(columns=["Success"])
-    success_df = success_df.reindex(columns=display_cols)
-
-    fail_df    = latest[~latest["Success"]].drop(columns=["Success"])
-    fail_df    = fail_df.reindex(columns=display_cols)
+    success_df = latest[latest["Success"]].drop(columns=["Success"]).reindex(columns=display_cols)
+    fail_df    = latest[~latest["Success"]].drop(columns=["Success"]).reindex(columns=display_cols)
 
     st.subheader(f"{title} — Success")
     st.dataframe(success_df, use_container_width=True, height=300)
